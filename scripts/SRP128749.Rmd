@@ -143,9 +143,11 @@ With the top 50 contributors, we run the ecologic network generator SPIEC-EASI.
 ```{r}
 SRP128749_rfFit_taxa <- 10000*as.matrix(t(SRP128749_ps_species_otu[SRP128749_rfFit_imp,]))
 SRP128749_rfFit_cor <- cor(SRP128749_rfFit_taxa)
-SRP128749_se <- SpiecEasi::spiec.easi(
-  SRP128749_rfFit_taxa, method='mb', lambda.min.ratio=1e-2,
-  nlambda=20, pulsar.params=list(rep.num=100, ncores=4))
+# SRP128749_se <- SpiecEasi::spiec.easi(
+#   SRP128749_rfFit_taxa, method='mb', lambda.min.ratio=1e-2,
+#   nlambda=20, pulsar.params=list(rep.num=100, ncores=4))
+
+load("../data/SRP128749_se.rda")
 ```
 
 We finally build a graph using correlations as the polarity of edges and we drop vertices without edges.

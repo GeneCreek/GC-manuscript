@@ -1,0 +1,196 @@
+---
+title: "DMM Community Types"
+author: "Marcel de Leeuw, (c) GeneCreek 2019"
+date: "12/11/2019"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{DMM Community Types}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+figfontsize = 8.5
+```
+
+```{r setup, echo=F}
+library(knitr)
+library(tidyverse)
+library(reshape2)
+library(Matrix)
+library(parallel)
+library(doParallel)
+library(caret)
+library(randomForest)
+library(DirichletMultinomial)
+library(SpiecEasi)
+library(igraph)
+library(GGally)
+```
+
+We use a Matrix object with combined relative abundances of all nine mucase data sets referenced in the publication as the substrate for the Dirichlet Multinomial Model analysis and compute goodness of fit (GOF) according to three of the provided metrics, Laplace, BIC and AIC.
+
+```{r}
+
+load("../data/mucosa_species_norm.rda")
+
+# mucosa_dmm_fit <- parallel::mclapply(1:10, DirichletMultinomial::dmn, 
+#    count=as.matrix(t(mucosa_species_norm*10000)), mc.cores=6)
+
+load("../data/mucosa_dmm_fit.rda")
+
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+mucosa_dmm_gof <- as_tibble(data.frame(index=1:10, 
+    Laplace=sapply(mucosa_dmm_fit, laplace), 
+    AIC=sapply(mucosa_dmm_fit, AIC), 
+    BIC=sapply(mucosa_dmm_fit, BIC))) %>%
+  dplyr::mutate(Laplace=range01(Laplace), AIC=range01(AIC), BIC=range01(BIC))
+mucosa_dmm_gof <- reshape2::melt(
+  mucosa_dmm_gof, id.vars=c("index"), variable.name = "measure", value.name="gof")
+
+ggplot(mucosa_dmm_gof, aes(x=index, y=gof, fill=measure)) + 
+    geom_line() + geom_point(size=3, shape=21) +
+    xlab("components") + ylab("normalized goodness of fit") +
+    scale_fill_manual(values=c('#999999','#E69F00', '#009FE6'), guide = guide_legend(title="a")) +
+    scale_x_continuous(breaks=c(1:10)) +
+    theme_classic() +
+    theme(axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line=element_blank(),
+          legend.position="top")
+```
+
+As per recommended use of the package, we priviledge the Laplace criterium which indicates optimal GOF at k=6 components, but an alternative choice could be 4. We add the sample community type to the sample metadata and plot the precomputed phylogenetic diversity (whole tree) as a function of community type.
+
+```{r}
+
+load("../data/mucosa_mt.rda")
+
+mucosa_mt_dmm <- mucosa_mt %>% 
+  dplyr::mutate(dmm=factor(max.col(mixture(mucosa_dmm_fit[[6]], ties.method="first"))))
+
+figfontsize <- 8.5
+ggplot(mucosa_mt_dmm,
+       aes(x=dmm, y=phylodiv, fill=dmm, group=dmm)) +
+  geom_boxplot(notch=F, outlier.shape=NA) +
+  geom_jitter(shape=21, width=.1, fill="white") +
+  coord_flip() + guides(fill=F) +
+  ylab("PD whole tree") + xlab("") +
+  theme_classic() +
+  theme(axis.line=element_blank(), strip.background=element_blank(),
+        text=element_text(family="Open Sans", size=figfontsize),
+        axis.text=element_text(size=rel(1)))
+```
+
+Next we query for the top 100 contributing species-level taxa to the community type differentiation which we catagorize in periodontal pathogens, other pathogens or none.
+
+```{r}
+soi_dental <- c(
+  "Actinomyces odontolyticus",
+  "Veillonella parvula",
+  "Streptococcus sanguinis",
+  "Streptococcus oralis",
+  "Campylobacter concisus",
+  "Eikenella corrodens",
+  "Actinobacillus actinomycetemcomitans",
+  "Parvimonas micra",
+  "Fusobacterium nucleatum",
+  "Fusobacterium periodonticum",
+  "Streptococcus constellatus",
+  "Porphyromonas gingivalis",
+  "Tannerella forsythia",
+  "Treponema denticola",
+  "Prevotella intermedia",
+  "Prevotella nigrescens",
+  "Eubacterium nodatum",
+  "Streptococcus intermedius",
+  "Campylobacter rectus",
+  "Porphyromonas endodontalis",
+  "Filifactor alocis",
+  "Peptostreptococcus stomatis",
+  "Streptococcus parasanguinis"
+)
+  
+soi_patho <- c(
+  "Clostridium perfringens",
+  "Bacillus cereus",
+  "Helicobacter pylori",
+  "Streptococcus agalactiae",
+  "Prevotella melaninogenica",
+  "Escherichia coli",
+  "Yersinia ruckeri",
+  "Propionibacterium acnes",
+  "Haemophilus influenzae"
+)
+  
+p1 <- fitted(mucosa_dmm_fit[[1]], scale=T)
+p6 <- fitted(mucosa_dmm_fit[[6]], scale=T)
+colnames(p6) <- paste("dmm", 1:6)
+importance <- rowSums(abs(p6 - as.vector(p1)))
+mucosa_contrib <- as_tibble(cbind(importance=importance, p6), rownames="taxon") %>%
+  dplyr::arrange(desc(importance)) %>%
+  dplyr::filter(grepl(" ", taxon)) %>%
+  dplyr::filter(row_number()<=100 | taxon %in% c(soi_dental, soi_patho)) %>%
+  dplyr::mutate(dmm=apply(.[,colnames(p6)], 1, function(x) names(x)[which.max(x)])) %>%
+  dplyr::select(taxon, importance, dmm) %>%
+  dplyr::mutate(soi=ifelse(taxon %in% soi_dental, "periodontal", ifelse(taxon %in% soi_patho, "other", NA)))
+
+table(mucosa_contrib$dmm, mucosa_contrib$soi)
+```
+
+Inspecting the detailed contributions, we find that H. pylori lands in community type three. We take a closer look at H. pylori by projecting its relative abundance accross the community types and find that community type two also has higher, but not extrem H. pylori content.
+
+```{r}
+palette = c("1" = "#88FFAA", "2"="#88AAFF", "3"="#FF8844", 
+            "4"="grey80", "5"="gold", "6"="pink")
+ggplot(mucosa_mt_dmm, aes(x=HPYL, fill=dmm)) +
+  geom_histogram(bins=30) + 
+  scale_fill_manual(values=palette) +
+  coord_flip() + guides(fill=F) + 
+  ylab("count") + xlab("H. pylori proportion") +
+  theme_classic() + 
+  theme(axis.line=element_blank(), axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        strip.background = element_blank(),
+        text=element_text(family="Open Sans", size=figfontsize),
+        axis.text=element_text(size=rel(1)),
+        strip.text=element_text(size=rel(1))) +
+  facet_grid(.~dmm, scales = "free_x")
+```
+
+Next, we run the ecological network generator SPIEC-EASI on the top species and generate a net<ork graph.
+
+```{r}
+
+mucosa_rfFit_taxa <- ceiling(10000*as.matrix(t(mucosa_species_norm[mucosa_contrib$taxon,])))
+mucosa_rfFit_cor <- cor(mucosa_rfFit_taxa)
+# mucosa_se <- spiec.easi(mucosa_rfFit_taxa, method='mb', lambda.min.ratio=1e-2,
+#                          nlambda=20, pulsar.params=list(rep.num=100, ncores=2))
+
+load("../data/mucosa_se.rda")
+
+mucosa_ig2 <- adj2igraph(
+  getRefit(mucosa_se)*mucosa_rfFit_cor, 
+  vertex.attr=list(name=mucosa_contrib$taxon))
+mucosa_ig2 <- igraph::set_vertex_attr(mucosa_ig2, "association", 
+                                      value=mucosa_contrib$dmm)
+palette = c("dmm 1" = "#88FFAA", "dmm 2"="#88AAFF", "dmm 3"="#FF8844", 
+            "dmm 4"="grey80", "dmm 5"="gold", "dmm 6"="pink")
+mucosa_edgecol = ifelse(igraph::E(mucosa_ig2)$weight>0, "grey50", "red")
+GGally::ggnet2(mucosa_ig2, size=6, layout.exp=.2,
+               label.size=3, color="association", palette=palette, 
+               label=dplyr::filter(mucosa_contrib, !is.na(soi))$taxon,
+               edge.color=mucosa_edgecol, edge.size=1) +
+  guides(colour=guide_legend(title=NULL, override.aes=list(size=4))) +
+  theme(text=element_text(family="Open Sans", size=figfontsize),
+        legend.title=element_text(size=rel(1)), 
+        legend.text=element_text(size=rel(1)),
+        legend.position="bottom")
+
+
+```
+
+
+

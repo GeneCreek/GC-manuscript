@@ -1,0 +1,170 @@
+---
+title: "Processing example: SRP128749"
+author: "Marcel de Leeuw, (c) GeneCreek 2019"
+date: "12/11/2019"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{"SRP128749"}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, echo=F}
+library(knitr)
+library(tidyverse)
+library(phyloseq)
+library(parallel)
+library(doParallel)
+library(caret)
+library(randomForest)
+library(SpiecEasi)
+library(igraph)
+library(GGally)
+```
+
+Data set SRP128749 contains samples from patients with gastric cancer (GC), in the form of tumor/peripherical/normal triplets. The dataset was preprocessed with dada2, multiple alignment and tree generation and is available in the form of a PhyloSeq object.
+
+```{r}
+load("../data/SRP128749_phyloseq.rda")
+
+SRP128749_phyloseq
+```
+
+To make our code more readable, we retrieve the sample (meta) data as a separate object.
+
+```{r}
+SRP128749_mt <- as_tibble(phyloseq::sample_data(SRP128749_phyloseq))
+
+SRP128749_mt
+```
+
+We get unweighted UniFrac distances from the raw amplicon sequence variants (ASVs) data...
+
+```{r}
+# cl <- parallel::makeCluster(8)
+# doParallel::registerDoParallel(cl)
+# SRP128749_uUF_dist <- phyloseq::UniFrac(SRP128749_phyloseq, weighted=F, normalized=T, parallel=T)
+# parallel::stopCluster(cl)
+load("../data/SRP128749_uUF_dist.rda")
+```
+
+... and proceed with a multidimensional scaling ordination.
+
+```{r}
+
+palette <- c(normal="#888888", peripherical="#4444CC", tumor="#CC4444")
+figfontsize <- 8.5
+
+SRP128749_uUF <- phyloseq::ordinate(SRP128749_phyloseq, method="MDS", distance=SRP128749_uUF_dist)
+phyloseq::plot_ordination(SRP128749_phyloseq, SRP128749_uUF, 
+                  type="sites", color="status", axes=2:3) +
+  scale_colour_manual(values=palette) +
+  stat_ellipse(level = 0.95) +
+  guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  theme_classic() +
+  theme(axis.line=element_blank(), legend.title=element_text(size=rel(1)), 
+        legend.text=element_text(size=rel(1)),
+        text=element_text(family="Open Sans", size=figfontsize),
+        axis.text=element_text(size=rel(1)))
+```
+
+Below, we use relative abundances and counts summarized at the species level.
+
+```{r}
+# SRP128749_ps_species <- phyloseq::tax_glom(SRP128749_phyloseq, "Species", NArm = F)
+load("../data/SRP128749_ps_species.rda")
+
+SRP128749_ps_species
+```
+
+So this leaves us with 867 species-level or higher order taxa. Below, we work with the OTU table, in which we prefer using human readable taxon identifiers instead of the ASV nucleotide sequence.
+
+```{r}
+SRP128749_ps_species_otu <- as.matrix(phyloseq::otu_table(SRP128749_ps_species))
+rownames(SRP128749_ps_species_otu) <- 
+  sapply(rownames(SRP128749_ps_species_otu),
+         function(otu) {
+           lineage <- as.character(phyloseq::tax_table(SRP128749_ps_species)[otu])
+           level <- length(which(gsub("\\w__", "", lineage) != ""))
+           if (level==7) {
+             paste(gsub("\\w__", "", lineage[6]), gsub("\\w__", "", lineage[7]))
+           } else
+             lineage[level]
+           })
+```
+
+We use caret to train a random forest model to disinguish between tumor/peripherical/normal samples on all available samples, so we can query for important species. We choose to focus on taxa which are resolved down to the species level only.
+
+```{r}
+
+SRP128749_training <- 
+  data.frame(status=SRP128749_mt$status, check.names = F, t(
+    SRP128749_ps_species_otu[which(grepl(" ", rownames(SRP128749_ps_species_otu))),]))
+
+# cl <- makeCluster(6)
+# registerDoParallel(cl)
+# SRP128749_rfFit <- caret::train(status ~ ., data=SRP128749_training, 
+#                                 method="rf", preProc="center", proximity=T)
+# stopCluster(cl)
+
+load("../data/SRP128749_rfFit.rda")
+```
+
+Next we query the model for significant variables, i.e. species. We retain the top 50 contributors. We allocate species to sample state (tumor/peripherical/normal) through the maximum of mean relative abundance.
+
+```{r}
+
+SRP128749_rfFit_imp <- 
+    (as_tibble(randomForest::importance(SRP128749_rfFit$finalModel), rownames = "taxon") %>%
+       dplyr::arrange(desc(MeanDecreaseGini)) %>%
+       dplyr::mutate(taxon = gsub("`", "", taxon)) %>%
+       dplyr::filter(row_number()<=50))$taxon
+
+SRP128749_rfFit_RA <- as_tibble(t(as.matrix((
+  SRP128749_training %>%
+    dplyr::select(status, SRP128749_rfFit_imp) %>%
+    dplyr::group_by(status) %>%
+    dplyr::summarise_all(mean))[,-1])), 
+  rownames="taxon", .name_repair = "unique") %>%
+  dplyr::rename(normal=...1, peripherical=...2, tumor=...3) %>%
+  dplyr::mutate(association=apply(.[,2:4], 1, function(x) names(x)[which.max(x)]))
+
+```
+
+With the top 50 contributors, we run the ecologic network generator SPIEC-EASI. 
+
+```{r}
+SRP128749_rfFit_taxa <- 10000*as.matrix(t(SRP128749_ps_species_otu[SRP128749_rfFit_imp,]))
+SRP128749_rfFit_cor <- cor(SRP128749_rfFit_taxa)
+SRP128749_se <- SpiecEasi::spiec.easi(
+  SRP128749_rfFit_taxa, method='mb', lambda.min.ratio=1e-2,
+  nlambda=20, pulsar.params=list(rep.num=100, ncores=4))
+```
+
+We finally build a graph using correlations as the polarity of edges and we drop vertices without edges.
+
+```{r}
+
+SRP128749_ig2 <- SpiecEasi::adj2igraph(
+  getRefit(SRP128749_se)*SRP128749_rfFit_cor, rmEmptyNodes=T,
+  vertex.attr=list(name=as.character(colnames(SRP128749_rfFit_taxa))))
+SRP128749_selection <- igraph::V(SRP128749_ig2)$name
+SRP128749_vertex <- SRP128749_rfFit_RA %>%
+  dplyr::filter(taxon %in% SRP128749_selection) %>%
+  dplyr::arrange(factor(taxon, levels=SRP128749_selection))
+SRP128749_ig2 <- igraph::set_vertex_attr(SRP128749_ig2, "association",
+                                         value=SRP128749_vertex$association)
+
+palette = c("tumor" = "#FF8888", "peripherical" = "gold", "normal" = "grey80")
+GGally::ggnet2(SRP128749_ig2,  size=4, layout.exp=.5,
+                 label.size=3, color="association", palette=palette, label=T)
+```
+
+
